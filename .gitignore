@@ -1,0 +1,6 @@
+.env
+new_env/
+__pycache__/
+*.pyc
+*.log
+tempCodeRunnerFile.python
