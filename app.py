@@ -213,7 +213,7 @@ with st.sidebar:
 youtube_link = st.text_input("Enter YouTube video link:")
 vid = extract_video_id(youtube_link) if youtube_link else ""
 if vid:
-    st.image(f"https://img.youtube.com/vi/{vid}/0.jpg", use_column_width=True)
+    st.image(f"https://img.youtube.com/vi/{vid}/0.jpg", use_container_width=True)
 
 with st.expander("Or paste a transcript manually"):
     manual_txt = st.text_area("Paste transcript text here")
