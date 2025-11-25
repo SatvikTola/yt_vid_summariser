@@ -11,39 +11,7 @@ from xml.etree.ElementTree import ParseError
 import streamlit as st
 from dotenv import load_dotenv
 import google.generativeai as genai
-import google.generativeai as genai
-
-def resolve_model_name(preferred: str) -> str:
-    """
-    Map a short model name like 'gemini-1.5-flash' to a real
-    model resource name that is actually available to this API key.
-    Works whether the API returns names like 'models/gemini-1.5-flash'
-    or something longer (e.g. 'projects/.../locations/.../models/...').
-    """
-    short = preferred.replace("models/", "")
-
-    try:
-        models = [
-            m.name
-            for m in genai.list_models()
-            if "generateContent" in getattr(m, "supported_generation_methods", [])
-        ]
-    except Exception:
-        return preferred
-
-    for cand in models:
-        if cand == preferred:
-            return cand
-        if cand == f"models/{short}":
-            return cand
-        if cand.split("/")[-1] == short:
-            return cand
-
-    for cand in models:
-        if "gemini-1.5" in cand:
-            return cand
-
-    return models[0] if models else preferred
+from google.api_core.exceptions import ResourceExhausted, NotFound
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -62,6 +30,8 @@ if not API_KEY:
     st.stop()
 
 genai.configure(api_key=API_KEY)
+
+# Only expose lightweight, generally-free models in the UI
 STABLE_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro"]
 DEFAULT_LANG_PREF = ["en", "en-US", "en-GB", "hi", "en-IN"]
 
@@ -70,7 +40,86 @@ PROMPT_PREFIX = (
     "as bullet points with key ideas and facts.\n\nTranscript:\n"
 )
 
-# ---------------- Helpers ----------------
+
+# ---------------- Gemini helpers ----------------
+def resolve_model_name(ui_name: str) -> str:
+    """
+    Map the name shown in the UI to the actual Gemini model ID.
+
+    We explicitly avoid the heavier 2.5-pro-preview models and always map
+    to the stable 'models/...' IDs that should exist for this API.
+    """
+    mapping = {
+        "gemini-1.5-flash": "models/gemini-1.5-flash",
+        "gemini-1.5-pro": "models/gemini-1.5-pro",
+    }
+
+    if ui_name in mapping:
+        return mapping[ui_name]
+
+    # If user ever types a raw model id themselves
+    if not ui_name.startswith("models/"):
+        return f"models/{ui_name}"
+    return ui_name
+
+
+def summarize_with_gemini(model_name: str, transcript_text: str) -> str:
+    """
+    Call Gemini to generate the summary.
+
+    If the selected model has no quota (ResourceExhausted), we fall back
+    to gemini-1.5-flash and show a friendly message in the UI.
+    """
+    resolved = resolve_model_name(model_name)
+    st.caption(f"Using Gemini model: `{resolved}`")
+
+    def _call(model_id: str) -> str:
+        model = genai.GenerativeModel(model_id)
+        resp = model.generate_content(PROMPT_PREFIX + transcript_text)
+        return (resp.text or "").strip()
+
+    try:
+        return _call(resolved)
+
+    except ResourceExhausted:
+        # Quota exhausted / not available for this model → try Flash
+        fallback_id = "models/gemini-1.5-flash"
+        if resolved != fallback_id:
+            st.warning(
+                "Quota is exhausted or not available for this Gemini model. "
+                "Falling back to **Gemini 1.5 Flash**, which is usually available "
+                "on the free tier."
+            )
+            try:
+                return _call(fallback_id)
+            except ResourceExhausted:
+                st.error(
+                    "Your Gemini API key has no remaining quota even for "
+                    "`gemini-1.5-flash`. Please check your Google AI Studio / "
+                    "GCP quotas or use a different API key."
+                )
+                return ""
+        else:
+            st.error(
+                "Your Gemini API key has no remaining quota for "
+                "`gemini-1.5-flash`. Please check your Google AI Studio / "
+                "GCP quotas or use a different API key."
+            )
+            return ""
+
+    except NotFound:
+        st.error(
+            f"The model `{resolved}` is not available for this project/API "
+            "version. Please select **Gemini 1.5 Flash** in the sidebar."
+        )
+        return ""
+
+    except Exception as e:
+        st.error(f"Gemini call failed: {e}")
+        return ""
+
+
+# ---------------- Transcript helpers ----------------
 def extract_video_id(url: str) -> str:
     """Support watch?v=ID, youtu.be/ID, /embed/ID, /shorts/ID, and raw 11-char IDs."""
     if not url:
@@ -78,6 +127,7 @@ def extract_video_id(url: str) -> str:
     part = url.strip().split("&")[0]
     if len(part) == 11 and "/" not in part and " " not in part:
         return part
+
     p = urlparse(url)
     if p.netloc.endswith("youtu.be"):
         return p.path.lstrip("/").split("?")[0]
@@ -90,6 +140,7 @@ def extract_video_id(url: str) -> str:
             return parts[-1].split("?")[0]
     return ""
 
+
 def list_available_transcripts(video_id: str, cookies_path: Optional[str] = None):
     info = {"manual": [], "generated": []}
     try:
@@ -99,6 +150,7 @@ def list_available_transcripts(video_id: str, cookies_path: Optional[str] = None
     except Exception as e:
         info["error"] = str(e)
     return info
+
 
 def fetch_transcript_text_api(
     video_id: str,
@@ -127,6 +179,7 @@ def fetch_transcript_text_api(
             time.sleep(1.5 * (attempt + 1))
             continue
 
+        # Try via list_transcripts
         try:
             ts = YouTubeTranscriptApi.list_transcripts(video_id, cookies=cookies_path)
             try:
@@ -135,7 +188,6 @@ def fetch_transcript_text_api(
                 t = next(iter(ts._manually_created_transcripts.values()), None) \
                     or next(iter(ts._generated_transcripts.values()), None)
                 if t is None:
-                    # pass all expected args
                     raise NoTranscriptFound(video_id, languages, {})
             txt = " ".join(c["text"] for c in t.fetch()).strip()
             if txt:
@@ -152,6 +204,7 @@ def fetch_transcript_text_api(
     # Normalize to NoTranscriptFound *with required args*
     raise NoTranscriptFound(video_id, languages, {})
 
+
 def _strip_vtt_to_text(vtt_text: str) -> str:
     """Convert WebVTT to plain text."""
     lines = []
@@ -165,13 +218,18 @@ def _strip_vtt_to_text(vtt_text: str) -> str:
         lines.append(line.strip())
     return " ".join(lines).strip()
 
+
 def _run_ytdlp(cmd: list) -> subprocess.CompletedProcess:
     """Run yt-dlp; if binary missing on PATH, try 'python -m yt_dlp'."""
     try:
         return subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        return subprocess.run(["python", "-m", "yt_dlp", *cmd[1:]],
-                              capture_output=True, text=True)
+        return subprocess.run(
+            ["python", "-m", "yt_dlp", *cmd[1:]],
+            capture_output=True,
+            text=True,
+        )
+
 
 def fetch_transcript_text_ytdlp(
     video_id: str, lang: str = "en", cookies_path: Optional[str] = None
@@ -197,7 +255,8 @@ def fetch_transcript_text_ytdlp(
         if cookies_path:
             cmd.extend(["--cookies", cookies_path])
 
-        proc = _run_ytdlp(cmd)
+        _ = _run_ytdlp(cmd)
+
         vtt_path = os.path.join(tmpdir, f"{video_id}.{lang}.vtt")
         if not os.path.exists(vtt_path):
             candidates = [p for p in os.listdir(tmpdir) if p.endswith(".vtt")]
@@ -209,12 +268,7 @@ def fetch_transcript_text_ytdlp(
             vtt_text = f.read()
         return _strip_vtt_to_text(vtt_text)
 
-def summarize_with_gemini(model_name: str, transcript_text: str) -> str:
-    resolved = resolve_model_name(model_name)
-    st.caption(f"Using Gemini model: `{resolved}`")
-    model = genai.GenerativeModel(resolved)
-    resp = model.generate_content(PROMPT_PREFIX + transcript_text)
-    return resp.text
+
 # ---------------- UI ----------------
 st.title("YouTube Transcript to Detailed Notes Converter")
 
@@ -224,16 +278,18 @@ with st.sidebar:
     lang_pref = st.multiselect(
         "Preferred caption languages (order matters)",
         options=[
-            "en","en-US","en-GB","hi","en-IN","es","fr","de","it","pt","ru","zh",
-            "ja","ko","ar","tr","vi","id","bn","ta","te","mr"
+            "en", "en-US", "en-GB", "hi", "en-IN", "es", "fr", "de", "it", "pt", "ru",
+            "zh", "ja", "ko", "ar", "tr", "vi", "id", "bn", "ta", "te", "mr",
         ],
         default=DEFAULT_LANG_PREF,
     )
     st.markdown("**(Optional)** Pass YouTube cookies for age/region-restricted videos.")
-    cookies_mode = st.radio("Provide cookies via", ["None", "Upload file", "Path on disk"], index=0)
+    cookies_mode = st.radio(
+        "Provide cookies via", ["None", "Upload file", "Path on disk"], index=0
+    )
     cookies_path = None
     if cookies_mode == "Upload file":
-        up = st.file_uploader("Upload Netscape-format cookies file", type=["txt","cookies"])
+        up = st.file_uploader("Upload Netscape-format cookies file", type=["txt", "cookies"])
         if up is not None:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
             tmp.write(up.read())
@@ -250,15 +306,19 @@ vid = extract_video_id(youtube_link) if youtube_link else ""
 if vid:
     st.image(f"https://img.youtube.com/vi/{vid}/0.jpg", use_container_width=True)
 
+# Manual transcript path
 with st.expander("Or paste a transcript manually"):
     manual_txt = st.text_area("Paste transcript text here")
     if st.button("Summarize pasted transcript"):
         if manual_txt.strip():
-            st.markdown("## Detailed Notes:")
-            st.write(summarize_with_gemini(model_name, manual_txt.strip()))
+            summary = summarize_with_gemini(model_name, manual_txt.strip())
+            if summary:
+                st.markdown("## Detailed Notes:")
+                st.write(summary)
         else:
             st.warning("Please paste some transcript text.")
 
+# Automatic transcript path
 if st.button("Get Detailed Notes from YouTube") and vid:
     dbg = list_available_transcripts(vid, cookies_path=cookies_path)
     st.caption(f"Available transcripts: {dbg}")
@@ -269,7 +329,6 @@ if st.button("Get Detailed Notes from YouTube") and vid:
             vid, languages=lang_pref, cookies_path=cookies_path, max_retries=3
         )
     except (NoTranscriptFound, ParseError, TypeError) as e:
-        # TypeError covers older/newer signature mismatches just in case
         st.warning(f"API path failed: {e}")
     except TranscriptsDisabled:
         st.error("Transcripts are disabled for this video.")
@@ -293,5 +352,6 @@ if st.button("Get Detailed Notes from YouTube") and vid:
         )
     else:
         summary = summarize_with_gemini(model_name, text)
-        st.markdown("## Detailed Notes:")
-        st.write(summary)
+        if summary:
+            st.markdown("## Detailed Notes:")
+            st.write(summary)
