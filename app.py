@@ -11,6 +11,40 @@ from xml.etree.ElementTree import ParseError
 import streamlit as st
 from dotenv import load_dotenv
 import google.generativeai as genai
+import google.generativeai as genai
+
+def resolve_model_name(preferred: str) -> str:
+    """
+    Map a short model name like 'gemini-1.5-flash' to a real
+    model resource name that is actually available to this API key.
+    Works whether the API returns names like 'models/gemini-1.5-flash'
+    or something longer (e.g. 'projects/.../locations/.../models/...').
+    """
+    short = preferred.replace("models/", "")
+
+    try:
+        models = [
+            m.name
+            for m in genai.list_models()
+            if "generateContent" in getattr(m, "supported_generation_methods", [])
+        ]
+    except Exception:
+        return preferred
+
+    for cand in models:
+        if cand == preferred:
+            return cand
+        if cand == f"models/{short}":
+            return cand
+        if cand.split("/")[-1] == short:
+            return cand
+
+    for cand in models:
+        if "gemini-1.5" in cand:
+            return cand
+
+    return models[0] if models else preferred
+
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     NoTranscriptFound,
