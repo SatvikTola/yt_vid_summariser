@@ -31,7 +31,7 @@ if not API_KEY:
 
 genai.configure(api_key=API_KEY)
 
-# Only expose lightweight, generally-free models in the UI
+# Models shown in the sidebar
 STABLE_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro"]
 DEFAULT_LANG_PREF = ["en", "en-US", "en-GB", "hi", "en-IN"]
 
@@ -40,83 +40,80 @@ PROMPT_PREFIX = (
     "as bullet points with key ideas and facts.\n\nTranscript:\n"
 )
 
-
 # ---------------- Gemini helpers ----------------
-def resolve_model_name(ui_name: str) -> str:
+def resolve_model_candidates(ui_name: str) -> list[str]:
     """
-    Map the name shown in the UI to the actual Gemini model ID.
+    Return a list of candidate model IDs to try for the given UI name.
 
-    We explicitly avoid the heavier 2.5-pro-preview models and always map
-    to the stable 'models/...' IDs that should exist for this API.
+    We *first* try the short id ('gemini-1.5-flash'), then the
+    'models/...' form. This covers both styles of deployment.
     """
-    mapping = {
-        "gemini-1.5-flash": "models/gemini-1.5-flash",
-        "gemini-1.5-pro": "models/gemini-1.5-pro",
-    }
-
-    if ui_name in mapping:
-        return mapping[ui_name]
-
-    # If user ever types a raw model id themselves
-    if not ui_name.startswith("models/"):
-        return f"models/{ui_name}"
-    return ui_name
+    base = ui_name.replace("models/", "")
+    candidates = [base, f"models/{base}"]
+    # Deduplicate while preserving order
+    seen = set()
+    out: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
 
 
-def summarize_with_gemini(model_name: str, transcript_text: str) -> str:
+def summarize_with_gemini(ui_model_name: str, transcript_text: str) -> str:
     """
     Call Gemini to generate the summary.
 
-    If the selected model has no quota (ResourceExhausted), we fall back
-    to gemini-1.5-flash and show a friendly message in the UI.
+    - Try multiple aliases for the same model id (short and 'models/..').
+    - If quota is exhausted (ResourceExhausted), fall back to gemini-1.5-flash.
     """
-    resolved = resolve_model_name(model_name)
-    st.caption(f"Using Gemini model: `{resolved}`")
-
     def _call(model_id: str) -> str:
+        st.caption(f"Using Gemini model: `{model_id}`")
         model = genai.GenerativeModel(model_id)
         resp = model.generate_content(PROMPT_PREFIX + transcript_text)
         return (resp.text or "").strip()
 
-    try:
-        return _call(resolved)
+    # 1) Try requested model with both aliases
+    last_notfound = None
+    for cand in resolve_model_candidates(ui_model_name):
+        try:
+            return _call(cand)
+        except NotFound as e:
+            last_notfound = e
+            continue
+        except ResourceExhausted:
+            # We'll handle quota below
+            last_notfound = None
+            break
 
-    except ResourceExhausted:
-        # Quota exhausted / not available for this model → try Flash
-        fallback_id = "models/gemini-1.5-flash"
-        if resolved != fallback_id:
-            st.warning(
-                "Quota is exhausted or not available for this Gemini model. "
-                "Falling back to **Gemini 1.5 Flash**, which is usually available "
-                "on the free tier."
-            )
-            try:
-                return _call(fallback_id)
-            except ResourceExhausted:
-                st.error(
-                    "Your Gemini API key has no remaining quota even for "
-                    "`gemini-1.5-flash`. Please check your Google AI Studio / "
-                    "GCP quotas or use a different API key."
-                )
-                return ""
-        else:
-            st.error(
-                "Your Gemini API key has no remaining quota for "
-                "`gemini-1.5-flash`. Please check your Google AI Studio / "
-                "GCP quotas or use a different API key."
-            )
-            return ""
-
-    except NotFound:
+    # 2) If we got here because of NotFound on all candidates
+    if last_notfound is not None:
         st.error(
-            f"The model `{resolved}` is not available for this project/API "
-            "version. Please select **Gemini 1.5 Flash** in the sidebar."
+            f"The selected model (`{ui_model_name}`) is not available for this API key. "
+            "Please check your Google AI Studio project or switch to a different model "
+            "(for example **Gemini 1.5 Flash**)."
         )
         return ""
 
-    except Exception as e:
-        st.error(f"Gemini call failed: {e}")
-        return ""
+    # 3) Fallback path for ResourceExhausted or other issues: try flash explicitly
+    flash_name = "gemini-1.5-flash"
+    st.warning(
+        "Quota or configuration issue with the selected model. "
+        "Trying **Gemini 1.5 Flash** as a fallback."
+    )
+    for cand in resolve_model_candidates(flash_name):
+        try:
+            return _call(cand)
+        except ResourceExhausted:
+            continue
+        except NotFound:
+            continue
+
+    st.error(
+        "Could not call Gemini – either the models are not available for this API key "
+        "or all quotas are exhausted. Please verify your key in Google AI Studio."
+    )
+    return ""
 
 
 # ---------------- Transcript helpers ----------------
@@ -201,7 +198,6 @@ def fetch_transcript_text_api(
         except NoTranscriptFound:
             break
 
-    # Normalize to NoTranscriptFound *with required args*
     raise NoTranscriptFound(video_id, languages, {})
 
 
