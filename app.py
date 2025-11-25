@@ -210,10 +210,11 @@ def fetch_transcript_text_ytdlp(
         return _strip_vtt_to_text(vtt_text)
 
 def summarize_with_gemini(model_name: str, transcript_text: str) -> str:
-    model = genai.GenerativeModel(model_name)
+    resolved = resolve_model_name(model_name)
+    st.caption(f"Using Gemini model: `{resolved}`")
+    model = genai.GenerativeModel(resolved)
     resp = model.generate_content(PROMPT_PREFIX + transcript_text)
     return resp.text
-
 # ---------------- UI ----------------
 st.title("YouTube Transcript to Detailed Notes Converter")
 
